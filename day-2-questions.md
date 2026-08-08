@@ -758,3 +758,803 @@ Actually creates/runs containers
 We **will not go deeper into Controllers, Scheduler internals, Informers, Work Queues, Watches, ReplicaSet reconciliation, etc. yet**.
 
 When we reach each concept in the course, we'll take it apart **pin-to-pin** and connect it back to this architecture.
+
+---
+Absolutely. These are the **new questions you asked after the Day-2 notes**, organized as a continuation so you can directly add them to your running notes.
+
+# Day-2 — Deep-Dive Questions: Pod Creation, Scheduling & etcd
+
+## 1. What Are the Official Pod States?
+
+A Kubernetes Pod has five official **phases**:
+
+| Phase       | Meaning                                                                           |
+| ----------- | --------------------------------------------------------------------------------- |
+| `Pending`   | Pod has been accepted, but one or more containers are not yet running             |
+| `Running`   | Pod has been assigned to a node and at least one container is running or starting |
+| `Succeeded` | All containers terminated successfully                                            |
+| `Failed`    | All containers terminated and at least one container failed                       |
+| `Unknown`   | Kubernetes cannot determine the Pod's state                                       |
+
+### Important
+
+Do not confuse Pod **phases** with statuses/reasons such as:
+
+```text
+CrashLoopBackOff
+ImagePullBackOff
+ContainerCreating
+ErrImagePull
+```
+
+These are not official Pod phases.
+
+---
+
+# 2. First-Time `kubectl apply` — What Happens Internally?
+
+Suppose:
+
+```bash
+kubectl apply -f pod.yml
+```
+
+is executed for the first time.
+
+The high-level flow is:
+
+```text
+User
+  │
+  │ kubectl apply
+  ▼
+API Server
+  │
+  ├── Authentication
+  ├── Authorization
+  ├── Admission
+  └── Validation
+  │
+  ▼
+Pod Object
+  │
+  ▼
+etcd
+  │
+  │ Pod object persisted
+  ▼
+Scheduler
+  │
+  │ Finds suitable Worker Node
+  ▼
+API Server
+  │
+  │ Pod object updated with node assignment
+  ▼
+etcd
+  │
+  │ Updated state persisted
+  ▼
+Kubelet on selected Worker Node
+  │
+  ▼
+Container Runtime
+  │
+  ├── Pull image if required
+  ├── Create container
+  └── Start container
+  │
+  ▼
+Pod Running
+```
+
+---
+
+# 3. What Does "Pod Object Created" Actually Mean?
+
+When the API Server accepts the Pod request, Kubernetes first creates a **Pod object** in the cluster.
+
+Initially, the Pod may exist without a Worker Node assignment.
+
+Conceptually:
+
+```text
+Pod Object
+
+name:
+  nginx
+
+nodeName:
+  empty
+```
+
+So there are two different ideas:
+
+```text
+Pod Object Exists
+        ≠
+Pod Is Running
+```
+
+The Pod object can exist in Kubernetes before it has been scheduled onto a Worker Node.
+
+---
+
+# 4. What Does "Persisted" Mean?
+
+When we say:
+
+> "The Pod object is persisted."
+
+it means:
+
+> **The Kubernetes object/state is stored durably in `etcd`.**
+
+For example, after the initial creation:
+
+```text
+API Server
+    │
+    ▼
+etcd
+
+Pod:
+  name: nginx
+  nodeName: empty
+```
+
+After the Scheduler selects a node:
+
+```text
+Scheduler
+    │
+    │ "nginx → worker-node-1"
+    ▼
+API Server
+    │
+    ▼
+etcd
+```
+
+Now the persisted Pod state contains the scheduling decision:
+
+```text
+Pod:
+  name: nginx
+  nodeName: worker-node-1
+```
+
+### Important
+
+The Scheduler does **not normally write directly to etcd**.
+
+The normal conceptual flow is:
+
+```text
+Scheduler
+    ↓
+API Server
+    ↓
+etcd
+```
+
+Therefore:
+
+> **API Server manages access to the Kubernetes API; etcd is the persistent storage layer for Kubernetes cluster state.**
+
+---
+
+# 5. Does the Scheduler Receive the Request First?
+
+No.
+
+This is an important correction to the initial mental model.
+
+### Incorrect
+
+```text
+User
+  ↓
+Scheduler
+  ↓
+API Server
+```
+
+### Correct
+
+```text
+User
+  ↓
+API Server
+  ↓
+Pod Object
+  ↓
+Scheduler
+```
+
+The **API Server is the front door**.
+
+The Scheduler works after the Pod object has been accepted into the Kubernetes API and needs a node assignment.
+
+---
+
+# 6. How Does the Scheduler Know About Worker Nodes?
+
+This was one of the most important questions.
+
+The Scheduler needs information about Worker Nodes before it can decide where to place a Pod.
+
+Worker Nodes have kubelets.
+
+Conceptually:
+
+```text
+Worker Node-1
+     │
+   Kubelet
+     │
+     ▼
+API Server
+
+Worker Node-2
+     │
+   Kubelet
+     │
+     ▼
+API Server
+
+Worker Node-3
+     │
+   Kubelet
+     │
+     ▼
+API Server
+```
+
+The API Server therefore has information about the nodes and their state.
+
+The Scheduler watches the Kubernetes API and maintains an **internal scheduling cache** containing information required for scheduling decisions.
+
+Conceptually:
+
+```text
+              API Server
+             /     |     \
+            /      |      \
+        Node-1   Node-2   Node-3
+         info     info     info
+            \       |       /
+             \      |      /
+              Scheduler
+                  │
+           Scheduling Cache
+```
+
+---
+
+# 7. Does the API Server Ask Every Kubelet for Resources When a Pod Arrives?
+
+No.
+
+Do **not** visualize:
+
+```text
+New Pod arrives
+      ↓
+API Server
+      ↓
+Ask Kubelet of Node-1
+      ↓
+Ask Kubelet of Node-2
+      ↓
+Ask Kubelet of Node-3
+      ↓
+Give answers to Scheduler
+```
+
+Instead, visualize a **continuously updated cluster state**:
+
+```text
+Kubelets
+   │
+   │ continuously report node status
+   ▼
+API Server
+   │
+   │ exposes cluster state
+   ▼
+Scheduler
+   │
+   │ maintains internal scheduling cache
+   ▼
+Scheduling Decision
+```
+
+This is an important Kubernetes architecture pattern:
+
+> **Components observe cluster state through the API rather than making ad-hoc direct calls to every other component whenever they need information.**
+
+---
+
+# 8. What Resource Information Does the Scheduler Consider?
+
+The Scheduler needs information such as:
+
+```text
+Worker Node
+ ├── CPU capacity
+ ├── Memory capacity
+ ├── Allocatable CPU
+ ├── Allocatable memory
+ ├── Existing Pod resource requests
+ ├── Node labels
+ ├── Taints
+ ├── Node conditions
+ ├── Affinity/anti-affinity
+ └── Other scheduling constraints
+```
+
+For example:
+
+```text
+Node-1
+
+Allocatable CPU = 4 CPU
+Existing Pod requests = 3 CPU
+```
+
+Conceptually:
+
+```text
+Requestable CPU ≈ 1 CPU
+```
+
+If a new Pod requests:
+
+```yaml
+resources:
+  requests:
+    cpu: "2"
+```
+
+Node-1 may not be suitable because it cannot satisfy that request.
+
+---
+
+# 9. Resource Availability ≠ Current CPU Utilization
+
+Do not confuse:
+
+### Scheduling information
+
+```text
+CPU capacity
+Memory capacity
+Allocatable resources
+Pod resource requests
+Taints
+Affinity
+Node conditions
+```
+
+with:
+
+### Runtime/monitoring metrics
+
+```text
+Current CPU utilization = 80%
+Current memory utilization = 70%
+```
+
+Normal Kubernetes scheduling primarily relies on **resource requests, allocatable resources, and scheduling constraints**, rather than simply asking:
+
+> "Which node currently has the lowest CPU percentage?"
+
+This distinction becomes very important when learning:
+
+```text
+Resources
+   ↓
+requests
+   ↓
+limits
+   ↓
+Scheduler
+   ↓
+OOM
+   ↓
+HPA
+```
+
+---
+
+# 10. How Does the Scheduler Select a Worker Node?
+
+Suppose a new Pod requires:
+
+```text
+CPU = 2
+Memory = 2Gi
+```
+
+There are three Worker Nodes:
+
+```text
+             Scheduler
+                 │
+       ┌─────────┼─────────┐
+       ▼         ▼         ▼
+    Node-1     Node-2    Node-3
+      ✗           ✓         ✓
+```
+
+The Scheduler conceptually:
+
+```text
+1. Finds nodes
+       ↓
+2. Filters unsuitable nodes
+       ↓
+3. Evaluates suitable nodes
+       ↓
+4. Selects a node
+```
+
+For example:
+
+```text
+Node-1 → insufficient resources → reject
+
+Node-2 → suitable
+
+Node-3 → suitable
+```
+
+Then the Scheduler selects one of the suitable nodes according to its scheduling logic.
+
+The detailed filtering/scoring mechanism will be studied later when we learn the Scheduler deeply.
+
+---
+
+# 11. Scheduler Selects the Node — What Happens Next?
+
+Suppose Scheduler selects:
+
+```text
+worker-node-1
+```
+
+The Scheduler does not directly tell the kubelet:
+
+```text
+"Start this Pod."
+```
+
+Instead, the scheduling decision is recorded through the API Server.
+
+```text
+Scheduler
+    │
+    │ Pod → worker-node-1
+    ▼
+API Server
+    │
+    ▼
+etcd
+```
+
+The Pod object now conceptually contains:
+
+```text
+Pod:
+  name: nginx
+  nodeName: worker-node-1
+```
+
+Then:
+
+```text
+API Server
+    │
+    ▼
+Kubelet on worker-node-1
+    │
+    ▼
+Container Runtime
+    │
+    ▼
+Container
+```
+
+---
+
+# 12. Why Does `nodeName` Matter?
+
+Before scheduling:
+
+```text
+Pod:
+  nodeName: empty
+```
+
+This means:
+
+> The Pod has not been assigned to a Worker Node.
+
+After scheduling:
+
+```text
+Pod:
+  nodeName: worker-node-1
+```
+
+This means:
+
+> The Scheduler has assigned this Pod to `worker-node-1`.
+
+So the Scheduler's key responsibility can be visualized as:
+
+```text
+Pod
+nodeName = empty
+      │
+      ▼
+Scheduler
+      │
+      ▼
+nodeName = worker-node-1
+```
+
+The original YAML file is not being rewritten.
+
+**The Kubernetes Pod object stored in the cluster is being updated.**
+
+---
+
+# 13. Does Controller Manager Come Into This Bare Pod Flow?
+
+For a directly created Pod:
+
+```yaml
+kind: Pod
+```
+
+we should not put Deployment/ReplicaSet controllers into the main scheduling flow.
+
+The simplified flow is:
+
+```text
+kubectl
+   ↓
+API Server
+   ↓
+etcd
+   ↓
+Scheduler
+   ↓
+API Server
+   ↓
+etcd
+   ↓
+Kubelet
+   ↓
+Container Runtime
+   ↓
+Pod
+```
+
+There is no Deployment or ReplicaSet managing this Pod.
+
+### Important distinction
+
+This does NOT mean:
+
+> Controller Manager is completely inactive in the cluster.
+
+It means:
+
+> **The particular bare Pod creation flow is not being managed by a Deployment/ReplicaSet controller.**
+
+The Controller Manager is still running its controllers in the background.
+
+---
+
+# 14. When Does Controller Manager Become Important?
+
+Controller Manager becomes important when we start using resources managed by controllers.
+
+For example:
+
+```text
+Deployment
+ReplicaSet
+Job
+DaemonSet
+StatefulSet
+Node Controller
+```
+
+For example, with a Deployment:
+
+```text
+Deployment
+    ↓
+Deployment Controller
+    ↓
+ReplicaSet
+    ↓
+Pod
+    ↓
+Scheduler
+    ↓
+Kubelet
+    ↓
+Container Runtime
+    ↓
+Container
+```
+
+The controller's job is to continuously work toward the desired state.
+
+---
+
+# 15. Controller vs Scheduler vs Kubelet
+
+This is one of the most useful mental models to remember.
+
+### Controller
+
+> **"Do I have the state I am supposed to have?"**
+
+Example:
+
+```text
+Desired = 3 Pods
+Current = 2 Pods
+
+Controller:
+"I need another Pod."
+```
+
+### Scheduler
+
+> **"Which Worker Node should this unscheduled Pod run on?"**
+
+Example:
+
+```text
+Pod needs:
+CPU = 2
+Memory = 2Gi
+
+Scheduler:
+"worker-node-2 is suitable."
+```
+
+### Kubelet
+
+> **"This Pod has been assigned to my node. I need to make it run."**
+
+Example:
+
+```text
+Pod assigned to worker-node-2
+        ↓
+Kubelet on worker-node-2
+        ↓
+Container Runtime
+        ↓
+Container
+```
+
+---
+
+# 16. Complete Mental Flow
+
+For a **bare Pod**, think:
+
+```text
+                         USER
+                           │
+                           │ kubectl apply
+                           ▼
+                    ┌─────────────┐
+                    │ API SERVER  │
+                    └──────┬──────┘
+                           │
+                           ▼
+                         etcd
+                           │
+                           │
+                    Pod object exists
+                    nodeName = empty
+                           │
+                           ▼
+                       Scheduler
+                           │
+                    "Which node?"
+                           │
+                           ▼
+                  worker-node-1
+                           │
+                           ▼
+                      API Server
+                           │
+                           ▼
+                         etcd
+                           │
+                   nodeName updated
+                           │
+                           ▼
+              Kubelet on worker-node-1
+                           │
+                           ▼
+                  Container Runtime
+                           │
+                           ▼
+                          Pod
+```
+
+---
+
+# 17. The Most Important Understanding From These Questions
+
+The key Kubernetes pattern is:
+
+> **State is stored centrally, and components watch that state and react to changes.**
+
+Think:
+
+```text
+                API Server
+                    │
+                    │
+       ┌────────────┼─────────────┐
+       │            │             │
+       ▼            ▼             ▼
+     etcd      Scheduler     Controllers
+                    │             │
+                    │             │
+                    ▼             ▼
+                 Node          Desired State
+                    │
+                    ▼
+                 Kubelet
+                    │
+                    ▼
+             Container Runtime
+                    │
+                    ▼
+                   Pod
+```
+
+### Final mental model
+
+```text
+API Server
+    ↓
+Central API / communication hub
+
+etcd
+    ↓
+Persistent cluster state
+
+Scheduler
+    ↓
+Chooses the Worker Node
+
+Kubelet
+    ↓
+Makes the assigned Pod run
+
+Container Runtime
+    ↓
+Actually creates/runs containers
+
+Controller
+    ↓
+Continuously maintains desired state
+```
+
+For now, **do not go deeper into Scheduler internals, Controllers, Informers, Work Queues, Watches, ReplicaSet reconciliation, etc.** We will introduce each of these when we reach that topic and then connect it back to this basic flow.
+
