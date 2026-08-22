@@ -1,15 +1,3 @@
-Perfect. We'll do it the right way.
-
-We'll create **Day-1 Kubernetes Notes - Part 1** as if a **20+ years experienced DevOps Architect** is teaching. Every topic will answer:
-
-* **Why did this technology come?**
-* **What problem existed before?**
-* **How is it solved?**
-* **What happens in production?**
-* **Interview perspective**
-
-We'll not simply define concepts.
-
 ---
 
 # Kubernetes Day-1 Notes
