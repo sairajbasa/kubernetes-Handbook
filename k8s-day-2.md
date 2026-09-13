@@ -1,5 +1,3 @@
-Got it. I found your **Day-2 running notes**. 
-
 This day is much more important technically because you started **Kubernetes Architecture and the internal request flow**. So I’ll preserve your trainer's points, but make the notes work the way we discussed: **concept → why → internal flow → production scenario → troubleshooting → Kubernetes brain**.
 
 # Kubernetes — Day 2 Running Notes
