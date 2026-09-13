@@ -1,5 +1,3 @@
-Absolutely. I cleaned and organized your **Day 6 running notes** into structured Kubernetes notes while keeping the trainer's concepts, flow, examples, commands, and important interview/KT points.
-
 # =========================
 
 # DAY - 6
