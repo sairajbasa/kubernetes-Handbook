@@ -1065,3 +1065,247 @@ So your idea is **partially right**: **replicas can be used for a simple canary,
 
 ---
 
+```
+ingress controller is something different right
+```
+
+Yes, **Ingress Controller is a different concept**, but it can be used **to implement traffic routing for a Canary deployment**.
+
+Think of these as separate layers.
+
+### 1. Kubernetes Service
+
+A **Service** provides a stable network endpoint and distributes traffic to Pods selected by its labels.
+
+```text
+              Service
+                 |
+        ┌────────┼────────┐
+        ↓        ↓        ↓
+      Pod 1    Pod 2    Pod 3
+```
+
+### 2. Ingress
+
+**Ingress** is a Kubernetes API object that defines HTTP/HTTPS routing rules.
+
+For example:
+
+```text
+example.com/fashion → fashion-service
+example.com/mobile  → mobile-service
+```
+
+It says **where traffic should go**, but by itself it doesn't actually process the traffic.
+
+### 3. Ingress Controller
+
+The **Ingress Controller** is the actual component that watches Ingress resources and handles the incoming HTTP/HTTPS traffic.
+
+Examples include:
+
+* NGINX Ingress Controller
+* AWS Load Balancer Controller
+* Traefik
+* HAProxy
+
+Think:
+
+```text
+User
+  ↓
+Load Balancer
+  ↓
+Ingress Controller
+  ↓
+Ingress rules
+  ↓
+Service
+  ↓
+Pods
+```
+
+---
+
+### How this relates to Canary
+
+Suppose:
+
+```text
+Stable version = v1
+Canary version = v2
+```
+
+You can configure a suitable Ingress Controller to route traffic like:
+
+```text
+90% → v1
+10% → v2
+```
+
+Then:
+
+```text
+Ramp-up:
+
+90/10
+ ↓
+75/25
+ ↓
+50/50
+ ↓
+25/75
+ ↓
+0/100
+```
+
+Here, you're changing **traffic routing**, not necessarily changing the number of Pods.
+
+### The important distinction
+
+```text
+Replica count
+     ↓
+How many Pods exist
+
+
+Ingress Controller
+     ↓
+Where/how incoming traffic is routed
+```
+
+So when we were discussing **Canary + ramp-up/ramp-down**, the Ingress Controller is one possible mechanism for controlling the traffic percentage.
+
+And this connects nicely to your previous Kubernetes topic:
+
+> **Ingress = routing rules/API object**
+> **Ingress Controller = component that implements those rules**
+> **Canary = deployment/release strategy**
+> **Ramp-up/ramp-down = gradually changing traffic between versions**
+
+---
+
+```
+that means you are saying two ingress controller i need to install or what
+```
+No. **You do not need two Ingress Controllers.** That's the important point.
+
+You can have **one Ingress Controller** handling traffic for both the stable and canary versions.
+
+For example:
+
+```text
+                    Internet
+                       |
+                       ↓
+              Ingress Controller
+                       |
+              ┌────────┴────────┐
+              ↓                 ↓
+        Stable Service      Canary Service
+             v1                  v2
+          ┌─────┐             ┌─────┐
+          │Pods │             │Pods │
+          │v1   │             │v2   │
+          └─────┘             └─────┘
+```
+
+The Ingress Controller can route traffic between them according to the configuration/mechanism you're using.
+
+### Example
+
+You have:
+
+```text
+Stable:
+deployment-v1
+service-v1
+
+Canary:
+deployment-v2
+service-v2
+```
+
+You can have:
+
+```text
+                    Ingress Controller
+                           |
+                  ┌────────┴────────┐
+                  ↓                 ↓
+              service-v1        service-v2
+                  ↓                 ↓
+               v1 Pods           v2 Pods
+```
+
+Then your canary process could be conceptually:
+
+```text
+Initially:
+v1 → 100%
+v2 →   0%
+
+       ↓
+
+Canary:
+v1 → 90%
+v2 → 10%
+
+       ↓
+
+Ramp-up:
+v1 → 75%
+v2 → 25%
+
+       ↓
+
+v1 → 50%
+v2 → 50%
+
+       ↓
+
+v1 → 0%
+v2 → 100%
+```
+
+**One Ingress Controller can handle this.**
+
+---
+
+### But one important detail
+
+The exact way you configure **10%, 25%, 50% traffic splitting** depends on the Ingress Controller or another traffic-management tool.
+
+For example, some implementations support canary annotations or weighted routing; others may need a service mesh or a progressive-delivery tool such as **Argo Rollouts**.
+
+So keep these concepts separate:
+
+```text
+Deployment
+   ↓
+Creates/manages Pods
+
+Service
+   ↓
+Provides stable access to Pods
+
+Ingress
+   ↓
+Defines HTTP/HTTPS routing rules
+
+Ingress Controller
+   ↓
+Actually handles the HTTP/HTTPS traffic
+
+Canary
+   ↓
+Release strategy
+
+Ramp-up / Ramp-down
+   ↓
+Gradually shift traffic between v1 and v2
+```
+
+**So: one Ingress Controller → multiple Services → multiple application versions** is completely normal.
+
+---
