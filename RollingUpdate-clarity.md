@@ -1309,3 +1309,1015 @@ Gradually shift traffic between v1 and v2
 **So: one Ingress Controller → multiple Services → multiple application versions** is completely normal.
 
 ---
+
+```
+any KT you want to add extra regarding production
+```
+
+Yes. Since you're learning this from a **production DevOps perspective**, there are a few important pieces I'd add to your KT. Your current understanding of **RollingUpdate → Recreate → Canary → Ingress → ramp-up/ramp-down** is good, but production interviews often connect these concepts together.
+
+## 1. Don't confuse Deployment strategy with traffic strategy
+
+This is probably the **most important KT**.
+
+### Deployment strategy
+
+Controls **how Pods are replaced**:
+
+```text
+RollingUpdate
+Recreate
+```
+
+### Traffic strategy
+
+Controls **which version receives user traffic**:
+
+```text
+v1 → 90%
+v2 → 10%
+```
+
+They are related, but they are **not the same thing**.
+
+---
+
+## 2. RollingUpdate is not Canary
+
+This is another common interview trap.
+
+### RollingUpdate
+
+Suppose:
+
+```text
+4 replicas
+v1 → 4 Pods
+```
+
+During rollout:
+
+```text
+v1 → 3
+v2 → 1
+
+v1 → 2
+v2 → 2
+
+v1 → 1
+v2 → 3
+
+v1 → 0
+v2 → 4
+```
+
+Kubernetes gradually replaces Pods.
+
+But you're **not intentionally saying "send exactly 10% of users to v2."**
+
+### Canary
+
+You intentionally keep two versions:
+
+```text
+v1 → Stable
+v2 → Canary
+```
+
+and control traffic:
+
+```text
+95% → v1
+5%  → v2
+```
+
+Then:
+
+```text
+90/10
+75/25
+50/50
+0/100
+```
+
+So:
+
+> **RollingUpdate = gradual Pod replacement.**
+> **Canary = gradual exposure of a new version to users.**
+
+---
+
+# 3. Production Canary architecture
+
+A common conceptual architecture is:
+
+```text
+                         Users
+                           |
+                           ↓
+                    Load Balancer
+                           |
+                           ↓
+                  Ingress Controller
+                           |
+                 ┌─────────┴─────────┐
+                 ↓                   ↓
+            Stable Service       Canary Service
+                 ↓                   ↓
+             v1 Pods              v2 Pods
+```
+
+The traffic-routing mechanism determines something like:
+
+```text
+                 95%              5%
+                  ↓                ↓
+               Stable           Canary
+                 v1                v2
+```
+
+You **don't need two Ingress Controllers**.
+
+Usually one controller can route to both Services.
+
+---
+
+# 4. How do we decide whether to increase the canary?
+
+This is where production becomes interesting.
+
+You don't normally say:
+
+> "Wait 5 minutes and increase from 5% to 10%."
+
+You monitor metrics.
+
+For example:
+
+```text
+Canary = 5%
+
+        ↓
+
+Monitor
+
+Error rate
+Latency
+HTTP 5xx
+CPU / Memory
+Application metrics
+Business metrics
+
+        ↓
+
+Healthy?
+   /       \
+ YES        NO
+ ↓           ↓
+10%         0%
+```
+
+For example:
+
+```text
+5% traffic
+   ↓
+Monitor for 10 minutes
+   ↓
+No abnormal errors
+   ↓
+10%
+   ↓
+Monitor
+   ↓
+25%
+   ↓
+Monitor
+   ↓
+50%
+   ↓
+100%
+```
+
+This is **progressive delivery**.
+
+---
+
+# 5. Automatic rollback is very important
+
+Imagine:
+
+```text
+v1 → 95%
+v2 → 5%
+```
+
+Suddenly:
+
+```text
+v2 HTTP 5xx = 15%
+```
+
+Your production system should ideally detect this and stop the rollout.
+
+Conceptually:
+
+```text
+                 Canary 5%
+                     ↓
+                  Metrics
+                     ↓
+              Error threshold
+                     ↓
+                  EXCEEDED
+                     ↓
+               Stop rollout
+                     ↓
+              Traffic → v1
+```
+
+This is much safer than manually discovering the problem after thousands of users encounter it.
+
+---
+
+# 6. Readiness probe is extremely important
+
+This connects directly to your `maxUnavailable` discussion.
+
+Suppose Kubernetes creates:
+
+```text
+v2 Pod
+```
+
+but the application isn't actually ready.
+
+You should have:
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+```
+
+If the application isn't ready:
+
+```text
+Pod exists
+   ↓
+Readiness probe fails
+   ↓
+Pod not Ready
+   ↓
+Service doesn't send normal traffic to it
+```
+
+This is one reason **readiness probes are extremely important during deployments**.
+
+---
+
+# 7. Liveness vs Readiness
+
+Remember this production distinction:
+
+```text
+Readiness
+    ↓
+"Can I send traffic to you?"
+
+Liveness
+    ↓
+"Are you still functioning, or should I restart you?"
+```
+
+Example:
+
+```text
+Application starting
+       ↓
+Readiness = FAIL
+       ↓
+Don't send traffic
+
+Application becomes ready
+       ↓
+Readiness = PASS
+       ↓
+Send traffic
+```
+
+---
+
+# 8. `maxSurge` + `maxUnavailable` are availability controls
+
+For RollingUpdate:
+
+```text
+maxSurge
+   ↓
+How many EXTRA Pods can exist?
+
+maxUnavailable
+   ↓
+How many desired Pods can be unavailable?
+```
+
+Production teams tune these based on application requirements.
+
+For a critical application, you might want more capacity during deployment rather than allowing many Pods to disappear simultaneously.
+
+---
+
+# 9. What happens if the new version is bad?
+
+### RollingUpdate
+
+You can use:
+
+```bash
+kubectl rollout undo deployment/myapp
+```
+
+Conceptually:
+
+```text
+v1
+ ↓
+RollingUpdate
+ ↓
+v2 ❌
+ ↓
+Rollback
+ ↓
+v1
+```
+
+### Canary
+
+You can simply stop/ramp down the canary:
+
+```text
+v1 → 95%
+v2 → 5%
+
+v2 problem
+   ↓
+v1 → 100%
+v2 → 0%
+```
+
+That's one of the major operational benefits of Canary.
+
+---
+
+# 10. Argo Rollouts is worth learning
+
+Since you're already learning **Argo CD**, I strongly recommend understanding **Argo Rollouts** as the next step.
+
+Don't confuse:
+
+```text
+Argo CD
+```
+
+with:
+
+```text
+Argo Rollouts
+```
+
+### Argo CD
+
+Primarily handles:
+
+```text
+Git
+ ↓
+Desired Kubernetes state
+ ↓
+Sync
+ ↓
+Cluster
+```
+
+### Argo Rollouts
+
+Adds advanced deployment strategies such as:
+
+```text
+Canary
+Blue-Green
+Progressive delivery
+Automated analysis
+Automated promotion
+Rollback
+```
+
+A production flow can look like:
+
+```text
+Developer
+    ↓
+Git
+    ↓
+CI
+    ↓
+Build image
+    ↓
+Push image
+    ↓
+Update Kubernetes manifests
+    ↓
+Argo CD
+    ↓
+Argo Rollouts
+    ↓
+5% Canary
+    ↓
+Prometheus metrics
+    ↓
+Healthy?
+   /   \
+ Yes    No
+ ↓       ↓
+10%    Rollback
+ ↓
+25%
+ ↓
+50%
+ ↓
+100%
+```
+
+That is a **very good DevOps/DevSecOps interview scenario** to understand.
+
+---
+
+# 11. Blue-Green is another strategy you should know
+
+You now have:
+
+```text
+Recreate
+RollingUpdate
+Canary
+```
+
+Add:
+
+```text
+Blue-Green
+```
+
+Conceptually:
+
+```text
+             Load Balancer
+                  |
+             ┌────┴────┐
+             ↓         ↓
+          BLUE       GREEN
+           v1          v2
+```
+
+Initially:
+
+```text
+100% → BLUE
+```
+
+Test GREEN.
+
+If everything is good:
+
+```text
+100% → GREEN
+```
+
+Rollback:
+
+```text
+100% → BLUE
+```
+
+The key difference:
+
+**Canary** → gradual traffic shift.
+
+**Blue-Green** → maintain two environments and switch traffic between them.
+
+---
+
+# 12. Production decision tree
+
+This is the mental model I'd recommend memorizing:
+
+```text
+                 Deployment
+                     |
+        ┌────────────┼────────────┐
+        ↓            ↓            ↓
+     Recreate    RollingUpdate   Advanced
+                                  Delivery
+                                      |
+                              ┌───────┴───────┐
+                              ↓               ↓
+                           Canary         Blue-Green
+                              |
+                         Traffic shift
+                              |
+                       5 → 10 → 25 → 50 → 100%
+                              |
+                           Metrics
+                              |
+                     ┌────────┴────────┐
+                     ↓                 ↓
+                   Healthy           Unhealthy
+                     ↓                 ↓
+                  Promote           Rollback
+```
+
+### 🔥 Final production KT to remember
+
+If an interviewer asks:
+
+> **"How would you safely deploy a new version in production?"**
+
+A strong answer would connect everything:
+
+> "I would use a progressive deployment approach such as Canary. I would deploy the new version separately, expose a small percentage of traffic initially, and monitor readiness, error rates, latency, resource metrics, and application-specific metrics. If the canary remains healthy, I would gradually increase traffic. If metrics cross predefined thresholds, I would stop the rollout and route traffic back to the stable version. For automated progressive delivery, I can use Argo Rollouts integrated with Kubernetes, traffic routing, and monitoring such as Prometheus."
+
+That connects **Kubernetes + Ingress + Canary + monitoring + rollback + Argo** into one production story.
+
+---
+
+```
+now one linear to memorize
+```
+Absolutely. Memorize this **one linear flow** for Kubernetes deployment strategies:
+
+> **Deployment → Recreate / RollingUpdate → Canary → Traffic Routing → Ramp-up/Ramp-down → Monitor → Promote or Rollback**
+
+Or even simpler:
+
+```text
+Recreate      → DELETE ALL → CREATE NEW
+RollingUpdate → GRADUALLY REPLACE PODS
+Canary        → RUN OLD + NEW → SHIFT TRAFFIC GRADUALLY
+                         ↓
+              5% → 10% → 25% → 50% → 100%
+                         ↓
+                    MONITOR
+                    ↙      ↘
+               Healthy    Unhealthy
+                  ↓           ↓
+              PROMOTE      ROLLBACK
+```
+
+### 🧠 One sentence
+
+> **RollingUpdate gradually replaces Pods, while Canary gradually shifts user traffic from the old version to the new version; we monitor the new version and either promote it or roll back.**
+
+And remember:
+
+**`maxSurge` → extra Pods**
+**`maxUnavailable` → unavailable Pods**
+**Ingress/traffic routing → who gets the traffic**
+**Ramp-up → new version traffic ↑**
+**Ramp-down → old version traffic ↓**
+
+
+---
+
+```
+can you please also add about blue green deployment strategy
+```
+Absolutely. **Blue-Green Deployment** should be added alongside Recreate, RollingUpdate, and Canary because it is another important production deployment strategy.
+
+## 🔵🟢 Blue-Green Deployment
+
+The basic idea is:
+
+> **Run two separate versions of the application → send traffic to one → deploy/test the other → switch traffic when ready.**
+
+### Simple example
+
+Suppose your production application is running **v1**.
+
+```text
+                 Users
+                   |
+                   ↓
+            Load Balancer
+                   |
+                   ↓
+             BLUE v1
+          ┌─────┬─────┐
+          │ Pod │ Pod │
+          └─────┴─────┘
+             100% Traffic
+```
+
+Now you want to release **v2**.
+
+Instead of replacing v1 Pods one by one, you create a completely separate environment:
+
+```text
+                 Users
+                   |
+                   ↓
+            Load Balancer
+                   |
+          ┌────────┴────────┐
+          ↓                 ↓
+       BLUE v1           GREEN v2
+       OLD VERSION       NEW VERSION
+       100% Traffic       0% Traffic
+```
+
+You deploy v2 into **GREEN** and test it.
+
+```text
+BLUE
+v1
+100% traffic
+   ↓
+Running normally
+
+
+GREEN
+v2
+0% traffic
+   ↓
+Deploy + Test
+```
+
+If GREEN is healthy:
+
+```text
+BEFORE
+
+Users
+  |
+  ↓
+BLUE v1     ← 100%
+GREEN v2    ←   0%
+```
+
+Switch traffic:
+
+```text
+AFTER
+
+Users
+  |
+  ↓
+GREEN v2    ← 100%
+BLUE v1     ←   0%
+```
+
+Now **GREEN becomes production**.
+
+---
+
+# 🔄 What happens if v2 has a problem?
+
+This is one of the biggest advantages of Blue-Green.
+
+Suppose after switching to GREEN:
+
+```text
+GREEN v2
+   ↓
+5xx errors
+High latency
+Application issue
+```
+
+You can switch traffic back:
+
+```text
+Users
+  |
+  ↓
+BLUE v1     ← 100%
+GREEN v2    ←   0%
+```
+
+So rollback is basically:
+
+> **Switch traffic back to the previous environment.**
+
+---
+
+# 🏗️ Kubernetes Example
+
+Imagine:
+
+```text
+blue deployment
+    ↓
+blue-service
+    ↓
+v1 Pods
+
+
+green deployment
+    ↓
+green-service
+    ↓
+v2 Pods
+```
+
+Your traffic-routing layer can decide which Service receives production traffic.
+
+For example:
+
+```text
+                    Users
+                      |
+                      ↓
+              Load Balancer
+                      |
+                      ↓
+               Ingress Controller
+                 /           \
+                /             \
+               ↓               ↓
+        blue-service     green-service
+             ↓                 ↓
+          v1 Pods            v2 Pods
+```
+
+Initially:
+
+```text
+Ingress
+   |
+   ↓
+blue-service
+   |
+   ↓
+v1 Pods
+```
+
+After testing GREEN:
+
+```text
+Ingress
+   |
+   ↓
+green-service
+   |
+   ↓
+v2 Pods
+```
+
+The important point is that **Blue and Green are separate application versions/environments**, and traffic is switched between them.
+
+---
+
+# 🆚 Blue-Green vs Canary
+
+This is a very common interview question.
+
+### Blue-Green
+
+```text
+v1 → 100%
+v2 →   0%
+
+        SWITCH
+
+v1 →   0%
+v2 → 100%
+```
+
+Traffic usually moves **almost entirely from one version to the other**.
+
+### Canary
+
+```text
+v1 → 95%
+v2 →  5%
+
+        ↓
+
+v1 → 90%
+v2 → 10%
+
+        ↓
+
+v1 → 75%
+v2 → 25%
+
+        ↓
+
+v1 → 0%
+v2 → 100%
+```
+
+Traffic is shifted **gradually**.
+
+So remember:
+
+```text
+Blue-Green → SWITCH
+Canary      → GRADUAL SHIFT
+```
+
+---
+
+# 🆚 RollingUpdate vs Canary vs Blue-Green
+
+| Strategy          | Main idea                                   |
+| ----------------- | ------------------------------------------- |
+| **Recreate**      | Delete old Pods → create new Pods           |
+| **RollingUpdate** | Gradually replace old Pods with new Pods    |
+| **Canary**        | Gradually expose users to the new version   |
+| **Blue-Green**    | Run old + new environments → switch traffic |
+
+### Very important distinction
+
+**RollingUpdate** focuses mainly on **Pod replacement**.
+
+**Canary** focuses on **gradual user traffic exposure**.
+
+**Blue-Green** focuses on having **two environments and switching production traffic**.
+
+---
+
+# 🧠 Production example
+
+Imagine an e-commerce application.
+
+Current:
+
+```text
+BLUE = v1.0
+GREEN = v2.0
+```
+
+### Step 1 — Blue is production
+
+```text
+Users → Blue v1.0
+```
+
+### Step 2 — Deploy v2 to Green
+
+```text
+Users → Blue v1.0
+
+             Green v2.0
+             ↓
+          Test it
+```
+
+### Step 3 — Run validation
+
+Test:
+
+```text
+✓ Application health
+✓ API responses
+✓ Database connectivity
+✓ Login
+✓ Payment flow
+✓ Error rate
+✓ Latency
+```
+
+### Step 4 — Switch traffic
+
+```text
+Users → Green v2.0
+```
+
+### Step 5 — Monitor
+
+If healthy:
+
+```text
+Green → Production
+Blue  → Standby
+```
+
+If unhealthy:
+
+```text
+Green → Problem
+         ↓
+Switch back
+         ↓
+Blue → Production
+```
+
+---
+
+# ⚠️ Important production considerations
+
+Blue-Green sounds simple, but there are some challenges.
+
+### 1. Infrastructure cost
+
+You temporarily run both:
+
+```text
+Blue  → running
+Green → running
+```
+
+So you may need approximately **double the application infrastructure** during the deployment.
+
+### 2. Database compatibility
+
+This is very important.
+
+Suppose:
+
+```text
+Blue v1 → old database schema
+Green v2 → new database schema
+```
+
+You cannot blindly switch traffic if v1 cannot work with the new schema.
+
+Production teams often use **backward-compatible database changes** and expand/contract migration patterns.
+
+### 3. Session handling
+
+If users have sessions stored locally on the application servers, switching environments can cause problems.
+
+Usually, production systems externalize session/state where appropriate.
+
+### 4. Traffic switching
+
+You need some traffic-routing mechanism:
+
+```text
+Load Balancer
+Ingress
+Service
+DNS
+Service Mesh
+```
+
+depending on the architecture.
+
+---
+
+# 🔥 Your complete deployment-strategy memory map
+
+I would add Blue-Green to your existing notes like this:
+
+```text
+Kubernetes Deployment Strategies
+                |
+     ┌──────────┼───────────┐
+     ↓          ↓           ↓
+ Recreate   RollingUpdate  Blue-Green
+     |          |           |
+ DELETE ALL   Gradually    OLD + NEW
+     |         replace       |
+ CREATE NEW     Pods       SWITCH
+                            TRAFFIC
+                              |
+                              ↓
+                           Rollback
+```
+
+And Canary sits alongside them:
+
+```text
+Deployment Strategies
+        |
+        ├── Recreate
+        │     └── DELETE ALL → CREATE NEW
+        │
+        ├── RollingUpdate
+        │     └── GRADUALLY REPLACE PODS
+        │
+        ├── Blue-Green
+        │     └── OLD + NEW → SWITCH TRAFFIC
+        │
+        └── Canary
+              └── OLD + NEW → GRADUALLY SHIFT TRAFFIC
+                                      |
+                               5% → 10% → 25%
+                                      ↓
+                                  Monitor
+                                ↙         ↘
+                           Healthy      Unhealthy
+                              ↓             ↓
+                           Promote       Rollback
+```
+
+### 🧠 One-line memory
+
+> **Recreate = Replace all, RollingUpdate = Replace gradually, Blue-Green = Switch environments, Canary = Shift traffic gradually.**
+
+That distinction is **very interview-friendly** and also maps well to how these strategies are used in production.
+
+---
